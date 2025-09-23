@@ -18,6 +18,7 @@ import json
 import re
 import base64
 from google.oauth2 import service_account
+import google.auth
 
 logging.basicConfig(level=logging.INFO)
 
@@ -87,19 +88,32 @@ class VertexAIClient:
     def _setup_credentials(self):
         """Setup Google Cloud credentials"""
         try:
+            # 1) Prefer explicit service account file if provided and exists
             if VERTEX_AI_CREDENTIALS_PATH and os.path.exists(VERTEX_AI_CREDENTIALS_PATH):
                 self.credentials = service_account.Credentials.from_service_account_file(
                     VERTEX_AI_CREDENTIALS_PATH,
                     scopes=['https://www.googleapis.com/auth/cloud-platform']
                 )
-                logging.info("Vertex AI credentials loaded successfully")
-            else:
-                # Try using default credentials
+                logging.info("Vertex AI credentials loaded from VERTEX_AI_CREDENTIALS_PATH")
+                return
+
+            # 2) Try GOOGLE_APPLICATION_CREDENTIALS if it points to a valid file
+            gac_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+            if gac_path and os.path.exists(gac_path):
                 self.credentials = service_account.Credentials.from_service_account_file(
-                    os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', ''),
+                    gac_path,
                     scopes=['https://www.googleapis.com/auth/cloud-platform']
                 )
-                logging.info("Using default Google Cloud credentials")
+                logging.info("Vertex AI credentials loaded from GOOGLE_APPLICATION_CREDENTIALS path")
+                return
+
+            # 3) Fall back to Application Default Credentials (ADC)
+            creds, project = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+            self.credentials = creds
+            # If project id was not set, try to use the discovered one
+            if not self.project_id and project:
+                self.project_id = project
+            logging.info("Using Application Default Credentials for Vertex AI")
         except Exception as e:
             logging.error(f"Error setting up credentials: {e}")
             self.credentials = None
@@ -120,7 +134,10 @@ class VertexAIClient:
         """Make prediction using Vertex AI dedicated endpoint"""
         # For dedicated endpoints, the URL structure is different
         if self.dedicated_endpoint:
-            url = f"https://{self.dedicated_endpoint}/v1/models/default:predict"
+            url = (
+                f"https://{self.dedicated_endpoint}/v1/projects/{self.project_id}"
+                f"/locations/{self.region}/endpoints/{self.endpoint_id}:predict"
+            )
         else:
             # Fallback to standard REST API
             url = f"{self.base_url}/projects/{self.project_id}/locations/{self.region}/endpoints/{self.endpoint_id}:predict"
@@ -133,6 +150,9 @@ class VertexAIClient:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
+        if self.project_id:
+            # Some environments require user project header for quota and billing attribution
+            headers["x-goog-user-project"] = self.project_id
         
         # Prepare the request payload for MedSigLip model
         # Assuming the model expects image data in base64 format
