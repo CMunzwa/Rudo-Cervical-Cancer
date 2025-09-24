@@ -120,6 +120,8 @@ VERTEX_AI_PROJECT = os.environ.get("VERTEX_AI_PROJECT")
 VERTEX_AI_PROJECT_NUMBER = os.environ.get("VERTEX_AI_PROJECT_NUMBER")
 # Optional: inline credentials JSON (alternative to GOOGLE_APPLICATION_CREDENTIALS file)
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+# Optional: API key to authenticate directly to MedSigLip endpoint
+MEDSIGLIP_API = os.environ.get("MEDSIGLIP_API")
 
 # If VERTEX_AI_PROJECT not provided, try to infer from individual SA env vars
 if not VERTEX_AI_PROJECT:
@@ -136,6 +138,7 @@ class VertexAIClient:
         self.project_id = project_id
         self.endpoint_id = endpoint_id
         self.region = region
+        self.api_key = MEDSIGLIP_API
 
         # Standard public Vertex AI endpoint
         self.base_url = f"https://{region}-aiplatform.googleapis.com/v1"
@@ -149,39 +152,45 @@ class VertexAIClient:
             )
             logging.info(f"Using dedicated endpoint URL: {self.dedicated_endpoint_url}")
 
-        # Initialize Google credentials (ADC)
+        # Initialize auth: prefer MEDSIGLIP_API, else Google credentials
         self.credentials = None
-        try:
-            if GOOGLE_APPLICATION_CREDENTIALS_JSON:
-                info = json.loads(GOOGLE_APPLICATION_CREDENTIALS_JSON)
-                self.credentials = service_account.Credentials.from_service_account_info(
-                    info,
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
-                )
-                logging.info("Loaded Google credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON")
-            else:
-                # Try individual environment variables matching SA JSON fields
-                env_info = load_service_account_info_from_env()
-                if env_info:
+        if self.api_key:
+            logging.info("Using MEDSIGLIP_API for endpoint authentication")
+        else:
+            try:
+                if GOOGLE_APPLICATION_CREDENTIALS_JSON:
+                    info = json.loads(GOOGLE_APPLICATION_CREDENTIALS_JSON)
                     self.credentials = service_account.Credentials.from_service_account_info(
-                        env_info,
+                        info,
                         scopes=["https://www.googleapis.com/auth/cloud-platform"],
                     )
-                    logging.info("Loaded Google credentials from individual service account env vars")
+                    logging.info("Loaded Google credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON")
                 else:
-                    # Fallback to ADC
-                    self.credentials, _ = google.auth.default(
-                        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-                    )
-                    logging.info("Loaded Application Default Credentials for Google auth")
-        except Exception as e:
-            logging.error(f"Failed to load Google credentials: {e}")
-            self.credentials = None
+                    # Try individual environment variables matching SA JSON fields
+                    env_info = load_service_account_info_from_env()
+                    if env_info:
+                        self.credentials = service_account.Credentials.from_service_account_info(
+                            env_info,
+                            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                        )
+                        logging.info("Loaded Google credentials from individual service account env vars")
+                    else:
+                        # Fallback to ADC
+                        self.credentials, _ = google.auth.default(
+                            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                        )
+                        logging.info("Loaded Application Default Credentials for Google auth")
+            except Exception as e:
+                logging.error(f"Failed to load Google credentials: {e}")
+                self.credentials = None
 
     def get_auth_header(self):
         """Get OAuth2 Bearer token header from Google credentials."""
+        # If MEDSIGLIP_API is configured, use API key based auth
+        if self.api_key:
+            return {"Authorization": f"Bearer {self.api_key}", "x-api-key": self.api_key}
         if not self.credentials:
-            logging.error("Google credentials not available for Vertex AI authentication")
+            logging.error("Credentials not available for Vertex AI authentication")
             return {}
         try:
             if not self.credentials.valid:
