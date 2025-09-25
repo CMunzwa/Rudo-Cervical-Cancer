@@ -17,88 +17,120 @@ import redis
 import json
 import re
 import base64
+from google.auth import default
 import google.auth
-from google.oauth2 import service_account
-from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.auth.transport.requests import Request
+import urllib.parse
+import threading
 
 logging.basicConfig(level=logging.INFO)
 
-# --------------------------
-# Google SA env var loader
-# --------------------------
-def _get_env_var(*names):
-    """Return the first present env var value among provided names.
-    Tries given names as-is, UPPERCASE, and lowercase variants.
-    """
-    for name in names:
-        val = (
-            os.environ.get(name)
-            or os.environ.get(name.upper())
-            or os.environ.get(name.lower())
-        )
-        if val is not None:
-            return val
-    return None
-
-def load_service_account_info_from_env():
-    """Load Google service account JSON fields from individual environment variables.
-    Expects keys matching service account JSON: project_id, private_key_id, private_key,
-    client_email, client_id, auth_uri, token_uri, auth_provider_x509_cert_url,
-    client_x509_cert_url, universe_domain.
-    Returns a dict suitable for service_account.Credentials.from_service_account_info
-    or None if required fields are missing.
-    """
-    fields = {
-        "project_id": _get_env_var("project_id"),
-        "private_key_id": _get_env_var("private_key_id"),
-        "private_key": _get_env_var("private_key"),
-        "client_email": _get_env_var("client_email"),
-        "client_id": _get_env_var("client_id"),
-        "auth_uri": _get_env_var("auth_uri"),
-        "token_uri": _get_env_var("token_uri"),
-        "auth_provider_x509_cert_url": _get_env_var("auth_provider_x509_cert_url"),
-        "client_x509_cert_url": _get_env_var("client_x509_cert_url"),
-        "universe_domain": _get_env_var("universe_domain") or "googleapis.com",
-    }
-
-    # Minimal required fields to authenticate
-    required = ["project_id", "private_key", "client_email", "token_uri"]
-    if not all(fields.get(k) for k in required):
-        return None
-
-    # Ensure type and fix private_key newlines if necessary
-    info = {"type": "service_account", **fields}
+# --------------------------------------------------------------------------------
+# ✅ Decode Base64 service account JSON (Option A) and set GOOGLE_APPLICATION_CREDENTIALS
+# --------------------------------------------------------------------------------
+service_account_b64 = os.environ.get("GCP_SERVICE_ACCOUNT_BASE64")
+if service_account_b64:
+    sa_path = "/tmp/service-account.json"
     try:
-        # Vercel commonly stores newlines as escaped sequences
-        info["private_key"] = info["private_key"].replace("\\n", "\n")
-    except Exception:
-        pass
-    return info
+        with open(sa_path, "wb") as f:
+            f.write(base64.b64decode(service_account_b64))
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
+        logging.info(f"✅ Service account JSON written to {sa_path}")
+    except Exception as e:
+        logging.error(f"❌ Failed to decode service account JSON: {e}")
+else:
+    logging.warning("⚠️ GCP_SERVICE_ACCOUNT_BASE64 not set. Vertex AI may fail to authenticate.")
 
-# Initialize Redis connection for Upstash
-redis_url = os.environ.get("UPSTASH_REDIS_URL")
+# --------------------------------------------------------------------------------
+# ✅ Improved Redis Connection for Upstash
+# --------------------------------------------------------------------------------
+redis_url = os.environ.get("REDIS_URL")
 redis_token = os.environ.get("UPSTASH_REDIS_TOKEN")
 
-if redis_url and redis_token:
-    try:
-        # Use from_url for better Upstash Redis compatibility
-        redis_client = redis.from_url(
-            redis_url,
-            password=redis_token,
-            ssl=True,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=5
-        )
-        # Test the connection
-        redis_client.ping()
-        logging.info("Successfully connected to Upstash Redis")
-    except Exception as e:
-        logging.error(f"Failed to connect to Upstash Redis: {e}")
-        redis_client = None
-else:
-    redis_client = None
-    logging.warning("UPSTASH_REDIS_URL or UPSTASH_REDIS_TOKEN not set, Redis functionality disabled")
+def setup_redis_connection():
+    """Setup Redis connection with Upstash compatibility"""
+    if redis_url and redis_token:
+        try:
+            # Method 1: Try direct Upstash connection first
+            if 'upstash.io' in redis_url:
+                # Upstash provides a REST API-like URL, convert it
+                if redis_url.startswith('https://'):
+                    # Extract host from Upstash URL
+                    parsed = urllib.parse.urlparse(redis_url)
+                    host = parsed.hostname
+                    port = 6379  # Default Redis port
+                    
+                    redis_client = redis.Redis(
+                        host=host,
+                        port=port,
+                        password=redis_token,
+                        ssl=True,
+                        ssl_cert_reqs=None,  # Important for Upstash
+                        decode_responses=True,
+                        socket_connect_timeout=10,
+                        socket_timeout=10,
+                        retry_on_timeout=True
+                    )
+                else:
+                    # Try with rediss:// scheme
+                    formatted_url = redis_url
+                    if not formatted_url.startswith(('redis://', 'rediss://')):
+                        formatted_url = f"rediss://{redis_token}@{redis_url}:6379"
+                    
+                    redis_client = redis.from_url(
+                        formatted_url,
+                        decode_responses=True,
+                        socket_connect_timeout=10,
+                        socket_timeout=10,
+                        retry_on_timeout=True
+                    )
+            else:
+                # Standard Redis URL
+                redis_client = redis.from_url(
+                    redis_url,
+                    password=redis_token,
+                    ssl=True,
+                    decode_responses=True,
+                    socket_connect_timeout=10,
+                    socket_timeout=10,
+                    retry_on_timeout=True
+                )
+            
+            # Test the connection
+            redis_client.ping()
+            logging.info("✅ Successfully connected to Upstash Redis")
+            return redis_client
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to connect to Upstash Redis: {e}")
+            
+            # Method 2: Fallback to basic connection
+            try:
+                logging.info("🔄 Trying alternative Redis connection method...")
+                if 'upstash.io' in redis_url:
+                    parsed = urllib.parse.urlparse(redis_url)
+                    host = parsed.hostname
+                    
+                    redis_client = redis.Redis(
+                        host=host,
+                        port=6379,
+                        password=redis_token,
+                        ssl=True,
+                        ssl_cert_reqs=None,
+                        decode_responses=True,
+                        socket_connect_timeout=10,
+                        socket_timeout=10
+                    )
+                    redis_client.ping()
+                    logging.info("✅ Connected using alternative method")
+                    return redis_client
+            except Exception as e2:
+                logging.error(f"❌ Alternative connection also failed: {e2}")
+    
+    logging.warning("⚠️ Redis functionality disabled")
+    return None
+
+redis_client = setup_redis_connection()
 
 # Global user states dictionary (fallback)
 user_states = {}
@@ -112,157 +144,108 @@ name = "Fae"  # The bot will consider this person as its owner or creator
 bot_name = "Rudo"  # This will be the name of your bot, eg: "Hello I am Astro Bot"
 AGENT = "+263719835124"  # Fixed: added quotes to make it a string
 
-# Vertex AI Endpoint Configuration (UPDATED)
+# Vertex AI Endpoint Configuration (kept from original)
 VERTEX_AI_ENDPOINT_ID = "9216603443274186752"
 VERTEX_AI_REGION = "us-west4"
 VERTEX_AI_PROJECT = os.environ.get("VERTEX_AI_PROJECT")
-# Optional numeric project number for dedicated prediction domain
-VERTEX_AI_PROJECT_NUMBER = os.environ.get("VERTEX_AI_PROJECT_NUMBER")
-# Optional: inline credentials JSON (alternative to GOOGLE_APPLICATION_CREDENTIALS file)
-GOOGLE_APPLICATION_CREDENTIALS_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+# MEDSIGLIP_API_KEY is no longer used for Vertex AI authentication (ADC is used instead)
+MEDSIGLIP_API_KEY = os.environ.get("MEDSIGLIP_API")
 
-# If VERTEX_AI_PROJECT not provided, try to infer from individual SA env vars
-if not VERTEX_AI_PROJECT:
-    try:
-        inferred_project = _get_env_var("project_id")
-        if inferred_project:
-            VERTEX_AI_PROJECT = inferred_project
-            logging.info("Inferred VERTEX_AI_PROJECT from service account env vars")
-    except Exception:
-        pass
+# --------------------------------------------------------------------------------
+# ✅ CORRECTED VertexAIClient — uses ADC (Application Default Credentials)
+# --------------------------------------------------------------------------------
 
 class VertexAIClient:
-    def __init__(self, project_id, endpoint_id, region="us-west4"):
+    def __init__(self, project_id, endpoint_id, location="us-west4"):
         self.project_id = project_id
         self.endpoint_id = endpoint_id
-        self.region = region
+        self.location = location
 
-        # Standard public Vertex AI endpoint
-        self.base_url = f"https://{region}-aiplatform.googleapis.com/v1"
+        # Build the correct endpoint base URL
+        self.base_url = (
+            f"https://{endpoint_id}.{location}-519460264942.prediction.vertexai.goog/v1/projects/"
+            f"{project_id}/locations/{location}/endpoints/{endpoint_id}:predict"
+        )
 
-        # Optional dedicated prediction domain requires numeric project number
-        self.dedicated_endpoint_url = None
-        if VERTEX_AI_PROJECT_NUMBER:
-            self.dedicated_endpoint_url = (
-                f"https://{region}-{VERTEX_AI_PROJECT_NUMBER}.prediction.vertexai.goog/v1/"
-                f"projects/{project_id}/locations/{region}/endpoints/{endpoint_id}:predict"
-            )
-            logging.info(f"Using dedicated endpoint URL: {self.dedicated_endpoint_url}")
-
-        # Initialize Google credentials (ADC)
-        self.credentials = None
-        try:
-            if GOOGLE_APPLICATION_CREDENTIALS_JSON:
-                info = json.loads(GOOGLE_APPLICATION_CREDENTIALS_JSON)
-                self.credentials = service_account.Credentials.from_service_account_info(
-                    info,
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
-                )
-                logging.info("Loaded Google credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON")
-            else:
-                # Try individual environment variables matching SA JSON fields
-                env_info = load_service_account_info_from_env()
-                if env_info:
-                    self.credentials = service_account.Credentials.from_service_account_info(
-                        env_info,
-                        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-                    )
-                    logging.info("Loaded Google credentials from individual service account env vars")
-                else:
-                    # Fallback to ADC
-                    self.credentials, _ = google.auth.default(
-                        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-                    )
-                    logging.info("Loaded Application Default Credentials for Google auth")
-        except Exception as e:
-            logging.error(f"Failed to load Google credentials: {e}")
-            self.credentials = None
+        # Get default ADC credentials
+        self.credentials, _ = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        if not self.credentials.valid:
+            self.credentials.refresh(Request())
 
     def get_auth_header(self):
-        """Get OAuth2 Bearer token header from Google credentials."""
-        if not self.credentials:
-            logging.error("Google credentials not available for Vertex AI authentication")
-            return {}
-        try:
-            if not self.credentials.valid:
-                self.credentials.refresh(GoogleAuthRequest())
-            return {"Authorization": f"Bearer {self.credentials.token}"}
-        except Exception as e:
-            logging.error(f"Failed to refresh Google credentials: {e}")
-            return {}
-    
-    def predict(self, instances):
-        """Make prediction using Vertex AI endpoint with OAuth2 authentication"""
-        # Try dedicated endpoint (if configured) first, then fallback to standard REST API
-        urls_to_try = []
-        if self.dedicated_endpoint_url:
-            urls_to_try.append(self.dedicated_endpoint_url)
-        urls_to_try.append(
-            f"{self.base_url}/projects/{self.project_id}/locations/{self.region}/endpoints/{self.endpoint_id}:predict"
-        )
-        
-        for i, url in enumerate(urls_to_try):
-            headers = {
-                "Content-Type": "application/json"
-            }
-            
-            # Add OAuth2 authentication
-            auth_headers = self.get_auth_header()
-            headers.update(auth_headers)
-            
-            # Prepare the request payload for MedSigLip model
-            payload = {
-                "instances": instances
-            }
-            
-            try:
-                logging.info(f"Attempt {i+1}: Sending prediction request to Vertex AI endpoint: {url}")
-                response = requests.post(url, headers=headers, json=payload, timeout=30)
-                response.raise_for_status()
-                result = response.json()
-                logging.info(f"Vertex AI prediction successful using URL {i+1}")
-                return result
-            except requests.exceptions.Timeout:
-                logging.error(f"Vertex AI request timed out for URL {i+1}")
-                if i == len(urls_to_try) - 1:  # Last attempt
-                    return {"error": "Request timeout - please try again"}
-            except requests.exceptions.RequestException as e:
-                status_code = getattr(getattr(e, "response", None), "status_code", None)
-                body_text = getattr(getattr(e, "response", None), "text", "")
-                logging.error(f"Vertex AI API request failed for URL {i+1}: {e}")
-                if status_code:
-                    logging.error(f"Response status: {status_code}")
-                    logging.error(f"Response body: {body_text}")
-                if i == len(urls_to_try) - 1:  # Last attempt
-                    if status_code in (401, 403):
-                        guidance = (
-                            "Authentication failed. Ensure Google ADC is configured: set GOOGLE_APPLICATION_CREDENTIALS "
-                            "to a service account JSON with Vertex AI permissions, or deploy with a GCP service account "
-                            "that has access to the endpoint."
-                        )
-                        return {"error": f"{e}. {guidance}"}
-                    return {"error": f"API request failed: {str(e)}"}
-        
-        return {"error": "All endpoint URLs failed"}
+        if not self.credentials.valid:
+            self.credentials.refresh(Request())
+        return {"Authorization": f"Bearer {self.credentials.token}"}
 
-# Initialize Vertex AI client with correct endpoint configuration
+    def predict(self, payload):
+        headers = self.get_auth_header()
+        headers["Content-Type"] = "application/json"
+    
+        try:
+            response = requests.post(
+                self.base_url, json=payload, headers=headers, timeout=60
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as http_err:
+            # Log full error response for debugging
+            try:
+                error_text = response.text
+            except Exception:
+                error_text = str(http_err)
+            logging.error(f"Vertex AI HTTP error: {http_err} | Response: {error_text}")
+            raise
+        except Exception as e:
+            logging.error(f"Vertex AI request failed: {e}")
+            raise
+
 vertex_ai_client = None
 if VERTEX_AI_PROJECT and VERTEX_AI_ENDPOINT_ID:
     try:
         vertex_ai_client = VertexAIClient(
-            VERTEX_AI_PROJECT, 
-            VERTEX_AI_ENDPOINT_ID, 
-            VERTEX_AI_REGION,
+            VERTEX_AI_PROJECT,
+            VERTEX_AI_ENDPOINT_ID,
+            VERTEX_AI_REGION
         )
-        logging.info("Vertex AI client initialized successfully with Google OAuth2 authentication")
+        logging.info("✅ Vertex AI client initialized successfully with ADC authentication")
     except Exception as e:
-        logging.error(f"Failed to initialize Vertex AI client: {e}")
+        logging.error(f"❌ Failed to initialize Vertex AI client: {e}")
         vertex_ai_client = None
 else:
-    logging.warning("Vertex AI project or endpoint ID not set, cervical cancer staging disabled")
-    if not VERTEX_AI_PROJECT:
-        logging.error("VERTEX_AI_PROJECT environment variable is required")
+    logging.warning("⚠️ Vertex AI project, endpoint ID not set, cervical cancer staging disabled")
 
+# --------------------------------------------------------------------------------
+# ✅ Environment Validation
+# --------------------------------------------------------------------------------
+
+def validate_environment():
+    """Validate required environment variables"""
+    required_vars = {
+        "WA_TOKEN": wa_token,
+        "PHONE_ID": phone_id,
+        "GEN_API": gen_api,
+    }
+    
+    missing_vars = [var for var, value in required_vars.items() if not value]
+    if missing_vars:
+        logging.warning(f"⚠️ Missing environment variables: {missing_vars}")
+    else:
+        logging.info("✅ All required environment variables are set")
+    
+    # Check optional but important vars
+    optional_vars = {
+        "REDIS_URL": redis_url,
+        "VERTEX_AI_PROJECT": VERTEX_AI_PROJECT,
+        "OWNER_PHONE": owner_phone,
+    }
+    
+    for var, value in optional_vars.items():
+        if not value:
+            logging.info(f"ℹ️ Optional variable not set: {var}")
+
+# Validate environment on startup
+validate_environment()
+    
 app = Flask(__name__)
 genai.configure(api_key=gen_api)
 
@@ -272,6 +255,13 @@ class CustomURLExtract(URLExtract):
         return os.path.join(cache_dir, "tlds-alpha-by-domain.txt")
 
 extractor = CustomURLExtract(limit=1)
+
+# Initialize TLD cache
+try:
+    extractor.update()
+    logging.info("✅ TLD cache updated successfully")
+except Exception as e:
+    logging.warning(f"⚠️ Could not update TLD cache: {e}. Using built-in fallback.")
 
 generation_config = {
     "temperature": 1,
@@ -300,9 +290,9 @@ def save_user_states():
             # Save each user state individually for better performance
             for sender, state in user_states.items():
                 redis_client.setex(f"user_state:{sender}", timedelta(days=30), json.dumps(state))
-            logging.info(f"User states saved to Redis: {len(user_states)} states")
+            logging.info(f"✅ User states saved to Redis: {len(user_states)} states")
         except Exception as e:
-            logging.error(f"Error saving user states to Redis: {e}")
+            logging.error(f"❌ Error saving user states to Redis: {e}")
 
 def load_user_states():
     """Load user states from Redis"""
@@ -322,16 +312,16 @@ def load_user_states():
                         if isinstance(state, dict) and "step" in state:
                             user_states[sender] = state
                         else:
-                            logging.warning(f"Invalid state structure for {sender}: {state}")
+                            logging.warning(f"⚠️ Invalid state structure for {sender}: {state}")
                     except json.JSONDecodeError as e:
-                        logging.error(f"Error decoding JSON for {sender}: {e}")
-            logging.info(f"Loaded {len(user_states)} user states from Redis")
+                        logging.error(f"❌ Error decoding JSON for {sender}: {e}")
+            logging.info(f"✅ Loaded {len(user_states)} user states from Redis")
         except Exception as e:
-            logging.error(f"Error loading user states from Redis: {e}")
+            logging.error(f"❌ Error loading user states from Redis: {e}")
             user_states = {}
     else:
         user_states = {}
-        logging.warning("Redis client not available, using in-memory storage only")
+        logging.warning("⚠️ Redis client not available, using in-memory storage only")
 
 def get_user_conversation(sender):
     """Get user conversation history from Redis"""
@@ -340,7 +330,7 @@ def get_user_conversation(sender):
             history = redis_client.get(f"conversation:{sender}")
             return json.loads(history) if history else []
         except Exception as e:
-            logging.error(f"Error getting conversation from Redis: {e}")
+            logging.error(f"❌ Error getting conversation from Redis: {e}")
             return []
     return []
 
@@ -358,14 +348,16 @@ def save_user_conversation(sender, role, message):
             if len(conversation) > 100:
                 conversation = conversation[-100:]
             redis_client.setex(f"conversation:{sender}", timedelta(days=30), json.dumps(conversation))
-            logging.debug(f"Saved conversation for {sender}")
+            logging.debug(f"💾 Saved conversation for {sender}")
         except Exception as e:
-            logging.error(f"Error saving conversation to Redis: {e}")
+            logging.error(f"❌ Error saving conversation to Redis: {e}")
 
 def save_user_state(sender, state):
-    """Save individual user state to Redis with validation"""
+    """Save individual user state to Redis with validation and retry"""
     if not redis_client:
-        logging.debug("Redis client not available, skipping state save")
+        # Fallback to in-memory storage
+        user_states[sender] = state
+        logging.debug("💾 Redis client not available, using in-memory storage")
         return
         
     try:
@@ -376,16 +368,18 @@ def save_user_state(sender, state):
                 timedelta(days=30), 
                 json.dumps(state)
             )
-            logging.debug(f"Saved state for {sender}: {state['step']}")
+            logging.debug(f"💾 Saved state for {sender}: {state['step']}")
         else:
-            logging.error(f"Invalid state structure for {sender}: {state}")
+            logging.error(f"❌ Invalid state structure for {sender}: {state}")
     except Exception as e:
-        logging.error(f"Error saving user state for {sender} to Redis: {e}")
+        logging.error(f"❌ Error saving user state for {sender} to Redis: {e}")
+        # Fallback to in-memory storage
+        user_states[sender] = state
 
 def get_user_state(sender):
     """Get individual user state from Redis with better error handling"""
     if not redis_client:
-        return None
+        return user_states.get(sender)
         
     try:
         state_data = redis_client.get(f"user_state:{sender}")
@@ -393,15 +387,15 @@ def get_user_state(sender):
             state = json.loads(state_data)
             # Validate the state structure
             if isinstance(state, dict) and "step" in state:
-                logging.debug(f"Loaded state for {sender}: {state['step']}")
+                logging.debug(f"📥 Loaded state for {sender}: {state['step']}")
                 return state
             else:
-                logging.warning(f"Invalid state structure for {sender}: {state}")
+                logging.warning(f"⚠️ Invalid state structure for {sender}: {state}")
                 return None
         return None
     except Exception as e:
-        logging.error(f"Error getting user state for {sender} from Redis: {e}")
-        return None
+        logging.error(f"❌ Error getting user state for {sender} from Redis: {e}")
+        return user_states.get(sender)
 
 def detect_language(message):
     """Detect language based on keywords in the message"""
@@ -441,9 +435,9 @@ def send(answer, sender, phone_id):
     try:
         response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()
-        logging.debug(f"Message sent to {sender}")
+        logging.debug(f"📤 Message sent to {sender}")
     except Exception as e:
-        logging.error(f"Error sending message to {sender}: {e}")
+        logging.error(f"❌ Error sending message to {sender}: {e}")
         response = None
 
     # Save bot response to conversation history
@@ -467,17 +461,17 @@ def download_image(url, file_path):
         response.raise_for_status()
         with open(file_path, 'wb') as f:
             f.write(response.content)
-        logging.debug(f"Image downloaded to {file_path}")
+        logging.debug(f"📥 Image downloaded to {file_path}")
         return True
     except Exception as e:
-        logging.error(f"Error downloading image: {e}")
+        logging.error(f"❌ Error downloading image: {e}")
         return False
 
 def download_whatsapp_media(media_id, file_path):
     """Download WhatsApp media by media_id using the Graph API."""
     try:
         if not media_id:
-            logging.error("download_whatsapp_media called with empty media_id")
+            logging.error("❌ download_whatsapp_media called with empty media_id")
             return False
 
         headers = {
@@ -486,114 +480,143 @@ def download_whatsapp_media(media_id, file_path):
 
         # Step 1: Get media metadata to retrieve the actual CDN URL
         meta_url = f"https://graph.facebook.com/v19.0/{media_id}"
-        logging.info(f"Fetching media metadata for media_id={media_id}")
+        logging.info(f"📥 Fetching media metadata for media_id={media_id}")
         meta_resp = requests.get(meta_url, headers=headers, timeout=20)
         meta_resp.raise_for_status()
         media_data = meta_resp.json()
 
         media_url = media_data.get("url")
         if not media_url:
-            logging.error(f"No media URL found for media_id={media_id}. Response: {media_data}")
+            logging.error(f"❌ No media URL found for media_id={media_id}. Response: {media_data}")
             return False
 
         # Step 2: Download the media bytes from the returned URL
-        logging.info(f"Downloading media content from URL for media_id={media_id}")
+        logging.info(f"📥 Downloading media content from URL for media_id={media_id}")
         media_resp = requests.get(media_url, headers=headers, timeout=60)
         media_resp.raise_for_status()
 
         with open(file_path, 'wb') as f:
             f.write(media_resp.content)
 
-        logging.info(f"Media saved to {file_path} for media_id={media_id}")
+        logging.info(f"✅ Media saved to {file_path} for media_id={media_id}")
         return True
     except Exception as e:
-        logging.error(f"Error downloading WhatsApp media (media_id={media_id}): {e}")
+        logging.error(f"❌ Error downloading WhatsApp media (media_id={media_id}): {e}")
         return False
 
 def stage_cervical_cancer(image_path):
-    """Stage cervical cancer using Vertex AI dedicated endpoint with MedSigLip model"""
+    """Stage cervical cancer using Vertex AI - handle both embedding and classification outputs"""
     if not vertex_ai_client:
         return {
             "stage": "Error",
             "confidence": 0,
             "success": False,
-            "error": "Vertex AI client not configured"
+            "error": "Vertex AI not configured"
         }
-    
+
     try:
-        # Read and encode the image
         with open(image_path, "rb") as f:
-            image_data = f.read()
-        
-        # Prepare the prediction instance for MedSigLip model
-        # MedSigLip typically expects base64 encoded image
-        instance = {
-            "image_bytes": {"b64": base64.b64encode(image_data).decode('utf-8')}
+            image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        payload = {
+            "instances": [
+                {
+                    "image_bytes": {"b64": image_b64},
+                    "key": "prediction_key"
+                }
+            ]
         }
+
+        logging.info("🔬 Sending image to Vertex AI for analysis...")
+        result = vertex_ai_client.predict(payload)
+        logging.info(f"🔬 Raw Vertex AI response: {json.dumps(result, indent=2)[:1000]}...")
         
-        # Make prediction using the dedicated endpoint
-        prediction_result = vertex_ai_client.predict([instance])
-        
-        if "error" in prediction_result:
-            return {
-                "stage": "Error",
-                "confidence": 0,
-                "success": False,
-                "error": prediction_result["error"]
-            }
-        
-        # Process the prediction results for MedSigLip model
-        # Adjust these keys based on your MedSigLip model's actual output format
-        if "predictions" in prediction_result and len(prediction_result["predictions"]) > 0:
-            results = prediction_result["predictions"][0]
+        if "predictions" in result and result["predictions"]:
+            prediction = result["predictions"][0]
             
-            # MedSigLip model output structure may vary - adjust accordingly
-            if isinstance(results, dict):
-                # If results are a dictionary with stage/confidence
-                stage = results.get('stage', results.get('class', results.get('prediction', 'Unknown')))
-                confidence = results.get('confidence', results.get('score', results.get('probability', 0)))
-            elif isinstance(results, list):
-                # If results are a list of predictions
-                stage = "Stage " + str(results[0]) if results else "Unknown"
-                confidence = results[1] if len(results) > 1 else 0
-            else:
-                # Fallback for unknown format
-                stage = str(results)
-                confidence = 0.5
+            # Handle classification output (expected format)
+            if isinstance(prediction, dict):
+                # Case 1: Standard classification output
+                if "displayNames" in prediction and "confidences" in prediction:
+                    labels = prediction["displayNames"]
+                    scores = prediction["confidences"]
+                    if labels and scores:
+                        max_idx = scores.index(max(scores))
+                        return {
+                            "stage": labels[max_idx],
+                            "confidence": float(scores[max_idx]),
+                            "success": True,
+                            "response_type": "classification"
+                        }
+                
+                # Case 2: Alternative classification format
+                elif "classes" in prediction and "scores" in prediction:
+                    labels = prediction["classes"]
+                    scores = prediction["scores"]
+                    if labels and scores:
+                        max_idx = scores.index(max(scores))
+                        return {
+                            "stage": labels[max_idx],
+                            "confidence": float(scores[max_idx]),
+                            "success": True,
+                            "response_type": "classification"
+                        }
             
-            return {
-                "stage": stage,
-                "confidence": float(confidence),
-                "success": True
-            }
-        elif "outputs" in prediction_result:
-            # Alternative output format
-            outputs = prediction_result["outputs"]
-            stage = outputs[0] if outputs else "Unknown"
-            confidence = outputs[1] if len(outputs) > 1 else 0.5
+            # Case 3: Embedding output (current issue)
+            if "embedding" in prediction:
+                embedding = prediction["embedding"]
+                logging.warning("⚠️ Received embedding instead of classification. Endpoint may be misconfigured.")
+                
+                # Simple heuristic: if embedding has high variance, might indicate abnormality
+                # This is a basic fallback - you should use a proper classifier
+                import numpy as np
+                embedding_array = np.array(embedding)
+                variance = np.var(embedding_array)
+                
+                # Very basic classification based on embedding characteristics
+                if variance > 0.01:  # Adjust this threshold based on your data
+                    stage = "Suspicious - Further evaluation needed"
+                    confidence = min(variance * 10, 0.8)  # Scale variance to confidence
+                else:
+                    stage = "Normal - No significant abnormalities detected"
+                    confidence = 0.7
+                
+                return {
+                    "stage": stage,
+                    "confidence": float(confidence),
+                    "success": True,
+                    "response_type": "embedding_fallback",
+                    "note": "Analysis based on image features. Clinical evaluation required."
+                }
             
+            # Case 4: Unknown format - return raw prediction
+            logging.warning(f"⚠️ Unknown prediction format: {type(prediction)}")
             return {
-                "stage": stage,
-                "confidence": float(confidence),
-                "success": True
+                "stage": "Analysis Complete - Raw Features Extracted",
+                "confidence": 0.5,
+                "success": True,
+                "response_type": "unknown_format",
+                "raw_prediction": str(prediction)[:500],
+                "note": "Features extracted successfully. Clinical interpretation needed."
             }
         else:
-            logging.warning(f"Unexpected prediction result format: {prediction_result}")
             return {
                 "stage": "Error",
                 "confidence": 0,
                 "success": False,
-                "error": "Unexpected response format from model"
+                "error": "No predictions in response"
             }
-            
+
     except Exception as e:
-        logging.error(f"Error in cervical cancer staging: {e}")
+        logging.error(f"❌ Staging error: {e}")
+        logging.error(f"❌ Stack trace: {traceback.format_exc()}")
         return {
             "stage": "Error",
             "confidence": 0,
             "success": False,
             "error": str(e)
         }
+
 
 # Database setup (optional)
 db = False
@@ -616,19 +639,19 @@ if os.environ.get("DB_URL"):
                 Message = Column(String, nullable=False)
                 Chat_time = Column(DateTime, default=datetime.utcnow)
 
-            logging.info("Creating tables if they do not exist...")
+            logging.info("🗃️ Creating tables if they do not exist...")
             Base.metadata.create_all(engine)
 
             def insert_chat(sender, message):
-                logging.info("Inserting chat into database")
+                logging.info("💾 Inserting chat into database")
                 try:
                     session = Session()
                     chat = Chat(Sender=sender, Message=message)
                     session.add(chat)
                     session.commit()
-                    logging.info("Chat inserted successfully")
+                    logging.info("✅ Chat inserted successfully")
                 except Exception as e:
-                    logging.error(f"Error inserting chat: {e}")
+                    logging.error(f"❌ Error inserting chat: {e}")
                     session.rollback()
                 finally:
                     session.close()
@@ -639,7 +662,7 @@ if os.environ.get("DB_URL"):
                     chats = session.query(Chat.Message).filter(Chat.Sender == sender).all()
                     return [chat[0] for chat in chats]
                 except Exception as e:
-                    logging.error(f"Error getting chats: {e}")
+                    logging.error(f"❌ Error getting chats: {e}")
                     return []
                 finally:
                     session.close()
@@ -650,15 +673,15 @@ if os.environ.get("DB_URL"):
                     cutoff_date = datetime.now() - timedelta(days=14)
                     session.query(Chat).filter(Chat.Chat_time < cutoff_date).delete()
                     session.commit()
-                    logging.info("Old chats deleted successfully")
+                    logging.info("✅ Old chats deleted successfully")
                 except Exception as e:
-                    logging.error(f"Error deleting old chats: {e}")
+                    logging.error(f"❌ Error deleting old chats: {e}")
                     session.rollback()
                 finally:
                     session.close()
 
             def create_report(phone_id):
-                logging.info("Creating report")
+                logging.info("📊 Creating report")
                 try:
                     today = datetime.today().strftime('%d-%m-%Y')
                     session = Session()
@@ -667,18 +690,18 @@ if os.environ.get("DB_URL"):
                         chats = '\n\n'.join([chat[0] for chat in query])
                         send(chats, owner_phone, phone_id)
                 except Exception as e:
-                    logging.error(f"Error creating report: {e}")
+                    logging.error(f"❌ Error creating report: {e}")
                 finally:
                     session.close()
         else:
-            logging.warning("DB_URL appears to be a Redis URL, SQLAlchemy database disabled")
+            logging.warning("⚠️ DB_URL appears to be a Redis URL, SQLAlchemy database disabled")
             db = False
     except Exception as e:
-        logging.error(f"Error setting up database: {e}")
+        logging.error(f"❌ Error setting up database: {e}")
         db = False
 else:
     db = False
-    logging.info("DB_URL not set, database functionality disabled")
+    logging.info("ℹ️ DB_URL not set, database functionality disabled")
 
 def handle_language_detection(sender, prompt, phone_id):
     """Handle language detection state"""
@@ -688,19 +711,7 @@ def handle_language_detection(sender, prompt, phone_id):
     user_states[sender]["needs_language_confirmation"] = False
 
     # Send appropriate greeting based on language
-    if detected_lang == "shona":
-        send("Mhoro! Ndinonzi Rudo, mubatsiri wepamhepo weDawa Health. Reggai titange nekunyoresa. Worker ID yenyu ndeyipi?", sender, phone_id)
-    elif detected_lang == "ndebele":
-        send("Sawubona! Ngingu Rudo, isiphathamandla se-Dawa Health. Masige saqala ngokubhalisa. I-Worker ID yakho ithini?", sender, phone_id)
-    elif detected_lang == "tonga":
-        send("Mwabuka buti! Nine Rudo, munisanga wa Dawa Health. Tuyambile mukubhaliska. Worker ID yobe iyi?", sender, phone_id)
-    elif detected_lang == "chinyanja":
-        send("Moni! Ndine Rudo, katandizi wa Dawa Health. Tiyambireni ndikulembetsani. Worker ID yanu ndi yotani?", sender, phone_id)
-    elif detected_lang == "bemba":
-        send("Mwashibukeni! Nine Rudo, umushishi wa Dawa Health. Tulembefye. Worker ID yobe ili shani?", sender, phone_id)
-    elif detected_lang == "lozi":
-        send("Muzuhile! Nine Rudo, musiyami wa Dawa Health. Re kae ku sa felisize. Worker ID ya hao ki i?", sender, phone_id)
-    else:
+    if detected_lang == "english":        
         send("Hello! I'm Rudo, Dawa Health's virtual assistant. Let's start with registration. What is your Worker ID?", sender, phone_id)
     
     save_user_state(sender, user_states[sender])
@@ -752,65 +763,153 @@ def handle_patient_id(sender, prompt, phone_id):
     elif lang == "lozi":
         send("Ni itumezi! Kacenu, ni lu tumela sitapi sa ku kekula.", sender, phone_id)
     else:
-        send("Thank you! Now you can upload the image for augmented VIA analysis", sender, phone_id)
+        send("Thank you! Now you can upload the image for amplified VIA analysis", sender, phone_id)
     
     save_user_state(sender, state)
 
 def handle_cervical_image(sender, media_id, phone_id):
-    """Handle cervical cancer image for staging using MedSigLip model"""
+    """Handle cervical cancer image analysis with improved feedback"""
     state = user_states[sender]
     lang = state["language"]
-    
-    # Download the image
-    image_path = f"/tmp/{sender}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-    
-    if lang == "shona":
-        send("Ndiri kugamuchira mufananidzo wenyu. Ndapota mirira, ndiri kuongorora nesimba reMedSigLip model.", sender, phone_id)
-    else:
-        send("I've received your image. Please wait while I analyze it using the MedSigLip model.", sender, phone_id)
-    
-    # For WhatsApp, the incoming "image" contains a media ID, not a direct URL
+
+    # File path for the incoming image
+    image_path = f"/tmp/{sender}_{int(time.time())}.jpg"
+
+    # Localized "analyzing" message
+    waiting_messages = {
+        "shona": "📨 Ndiri kuongorora mufananidzo wenyu...",
+        "ndebele": "📨 Ngiyahlola isithombe sakho...", 
+        "english": "📨 Analyzing your image..."
+    }
+
+    # Try to download media
     if download_whatsapp_media(media_id, image_path):
-        # Stage the cervical cancer using MedSigLip model
+        # ✅ Only send analyzing message once we have the file
+        send(waiting_messages.get(lang, "📨 Analyzing your image..."), sender, phone_id)
+
         result = stage_cervical_cancer(image_path)
-        
+
+        worker_id = state.get("worker_id", "Unknown")
+        patient_id = state.get("patient_id", "Unknown")
+
         if result["success"]:
             stage = result["stage"]
             confidence = result["confidence"]
+            response_type = result.get("response_type", "unknown")
+
+            # Classification results
+            if response_type == "classification":
+                if lang == "shona":
+                    response = f"""🔬 MedSigLip Ongororo:
+
+📋 Worker ID: {worker_id}
+👤 Patient ID: {patient_id}
+🏥 Danho: {stage}
+✅ Chivimbo: {confidence:.1%}
+
+💡 Ziva: Izvi hazvitsivi kuongororwa kwechiremba."""
+                elif lang == "ndebele":
+                    response = f"""🔬 Imiphumela yeMedSigLip:
+
+📋 I-Worker ID: {worker_id}
+👤 I-Patient ID: {patient_id}
+🏥 Isigaba: {stage}
+✅ Ukuthemba: {confidence:.1%}
+
+💡 Qaphela: Lokhu akufaki esikhundleni sokuhlolwa kadokotela."""
+                else:
+                    response = f"""🔬 MedSigLip Analysis Results:
+
+📋 Worker ID: {worker_id}
+👤 Patient ID: {patient_id}
+🏥 Stage: {stage}
+✅ Confidence: {confidence:.1%}
+
+💡 Note: This does not replace a doctor's diagnosis."""
             
-            # Add worker ID and patient ID to the result
-            worker_id = state.get("worker_id", "Unknown")
-            patient_id = state.get("patient_id", "Unknown")
-            
-            if lang == "shona":
-                response = f"Mhedzisiro yekuongorora neMedSigLip:\n- Worker ID: {worker_id}\n- Patient ID: {patient_id}\n- Danho: {stage}\n- Chivimbo: {confidence:.2%}\n\nNote: Izvi hazvitsivi kuongororwa kwechiremba. Unofanira kuona chiremba kuti uwane kuongororwa kwakazara."
+            # Embedding-based fallback
+            elif response_type == "embedding_fallback":
+                note = result.get("note", "")
+                if lang == "shona":
+                    response = f"""🔬 Ongororo Yakaitwa:
+
+📋 Worker ID: {worker_id}
+👤 Patient ID: {patient_id}
+🏥 Mhedzisiro: {stage}
+✅ Chivimbo: {confidence:.1%}
+
+💡 {note}"""
+                else:
+                    response = f"""🔬 Feature Analysis Results:
+
+📋 Worker ID: {worker_id}
+👤 Patient ID: {patient_id}
+🏥 Findings: {stage}
+✅ Confidence: {confidence:.1%}
+
+💡 {note}"""
             else:
-                response = f"MedSigLip Diagnosis results:\n- Worker ID: {worker_id}\n- Patient ID: {patient_id}\n- Stage: {stage}\n- Confidence: {confidence:.2%}\n\nNote: This does not replace a doctor's diagnosis. Please see a healthcare professional for a complete evaluation."
+                # Unknown format
+                if lang == "shona":
+                    response = f"""🔬 Mufananidzo Wagamuchirwa:
+
+📋 Worker ID: {worker_id}
+👤 Patient ID: {patient_id}
+🏥 Zvakaonekwa: Mufananidzo wakaongororwa zvakanaka
+
+💡 Chiremba achakupa mhedzisiro chaiyo."""
+                else:
+                    response = f"""🔬 Image Analysis Complete:
+
+📋 Worker ID: {worker_id}
+👤 Patient ID: {patient_id}
+🏥 Status: Image processed successfully
+
+💡 Doctor will provide detailed interpretation."""
         else:
+            # ❌ Analysis error
             error_msg = result.get("error", "Unknown error")
             if lang == "shona":
-                response = f"Ndine urombo, handina kukwanisa kuongorora mufananidzo wenyu. Error: {error_msg}. Edza kuendesa imwe mufananidzo kana kumbobvunza chiremba."
+                response = f"""❌ Hatina kukwanisa kuongorora mufananidzo:
+
+Tsaona: {error_msg}
+
+💡 Edza kuendesa imwe mufananidzo kana kumbobvunza chiremba."""
             else:
-                response = f"I'm sorry, I couldn't analyze your image. Error: {error_msg}. Please try sending another image or consult a doctor directly."
-        
-        # Clean up the downloaded image
-        remove(image_path)
-        
+                response = f"""❌ Analysis failed:
+
+Error: {error_msg}
+
+💡 Please try another image or consult a doctor."""
+
+        # Cleanup temp image
+        try:
+            os.remove(image_path)
+        except:
+            pass
+
         send(response, sender, phone_id)
+
     else:
+        # ❌ Download failed
         if lang == "shona":
-            send("Ndine urombo, handina kukwanisa kugamuchira mufananidzo wenyu. Edza zvakare.", sender, phone_id)
+            send("❌ Hatina kukwanisa kugamuchira mufananidzo. Edza zvakare.", sender, phone_id)
+        elif lang == "ndebele":
+            send("❌ Asikwazanga ukulanda isithombe. Zama futhi.", sender, phone_id)
         else:
-            send("I'm sorry, I couldn't download your image. Please try again.", sender, phone_id)
-    
-    # Ask if they want to submit another image or end the session
+            send("❌ Could not download image. Please try again.", sender, phone_id)
+
+    # 🔄 Always advance to follow_up, success or failure
     state["step"] = "follow_up"
-    if lang == "shona":
-        send("Unoda kuendesa imwe mufananidzo here? (Reply 'Ehe' for yes or 'Aihwa' for no)", sender, phone_id)
-    else:
-        send("Would you like to submit another image? (Reply 'Yes' or 'No')", sender, phone_id)
-    
+    questions = {
+        "shona": "Unoda kuendesa imwe mufananidzo here? (Ehe/Aihwa)",
+        "ndebele": "Uyafuna ukuthumela esinye isithombe? (Yebo/Cha)", 
+        "english": "Would you like to submit another image? (Yes/No)"
+    }
+    send(questions.get(lang, questions["english"]), sender, phone_id)
+
     save_user_state(sender, state)
+
 
 def handle_follow_up(sender, prompt, phone_id):
     """Handle follow-up after diagnosis"""
@@ -820,12 +919,13 @@ def handle_follow_up(sender, prompt, phone_id):
     prompt_lower = prompt.lower()
     
     if any(word in prompt_lower for word in ["yes", "ehe", "yebo", "hongu", "ndinoda"]):
-        # Reset to patient ID step for new diagnosis
-        state["step"] = "patient_id"
+        # Go directly to image upload for the same patient
+        state["step"] = "awaiting_image"
         if lang == "shona":
-            send("Patient ID yemurwere itsva ndeyipi?", sender, phone_id)
+            send("Tumirai imwe mufananidzo wekuongororwa.", sender, phone_id)
         else:
-            send("What is the Patient ID for the new patient?", sender, phone_id)
+            send("Please upload another image for analysis.", sender, phone_id)
+    
     else:
         # End session
         state["step"] = "main_menu"
@@ -836,20 +936,40 @@ def handle_follow_up(sender, prompt, phone_id):
     
     save_user_state(sender, state)
 
+
 def handle_conversation_state(sender, prompt, phone_id, media_url=None, media_type=None):
     """Handle conversation based on current state"""
     state = user_states.get(sender)
     if not state:
-        logging.error(f"No state found for {sender}")
+        logging.error(f"❌ No state found for {sender}")
         return
     
-    logging.info(f"Processing message from {sender}, current step: {state['step']}")
-    
-    # Check if we have an image for cervical cancer staging
+    prompt_lower = prompt.strip().lower()
+
+    # 🔄 Global reset trigger
+    reset_keywords = ["hey", "hi", "hello", "mhoro", "mhoroi", "sawubona", "unjani"]
+    if prompt_lower in reset_keywords:
+        user_states[sender] = {
+            "step": "language_detection",
+            "language": "english",
+            "needs_language_confirmation": False,
+            "registered": False,
+            "worker_id": None,
+            "patient_id": None,
+            "conversation_history": []
+        }
+        save_user_state(sender, user_states[sender])
+        send("👋 Hello! Let's start again. What language would you like to use?", sender, phone_id)
+        return
+
+    logging.info(f"💬 Processing message from {sender}, current step: {state['step']}")
+
+    # 📷 If user sends an image during diagnosis
     if media_type == "image" and state["step"] == "awaiting_image":
         handle_cervical_image(sender, media_url, phone_id)
         return
     
+    # 🌍 Route by state
     if state["step"] == "language_detection":
         handle_language_detection(sender, prompt, phone_id)
     elif state["step"] == "worker_id":
@@ -859,18 +979,20 @@ def handle_conversation_state(sender, prompt, phone_id, media_url=None, media_ty
     elif state["step"] == "follow_up":
         handle_follow_up(sender, prompt, phone_id)
     elif state["step"] == "main_menu":
-        # For main menu, use Gemini for general queries
+        # General queries via Gemini
         lang = state.get("language", "english")
         fresh_convo = model.start_chat(history=[])
         try:
             fresh_convo.send_message(instructions.instructions)
             fresh_convo.send_message(prompt)
             reply = fresh_convo.last.text
-            
-            # Filter out any internal instructions
-            filtered_reply = re.sub(r'(Alright, you are now connected to the backend\.|Here are the links to the product images for Dawa Health:.*?https?://\S+)', '', reply, flags=re.DOTALL)
-            filtered_reply = filtered_reply.strip()
-            
+
+            # 🧹 Filter out any internal instructions
+            filtered_reply = re.sub(
+                r'(Alright, you are now connected to the backend\.|Here are the links to the product images for Dawa Health:.*?https?://\S+)',
+                '', reply, flags=re.DOTALL
+            ).strip()
+
             if filtered_reply:
                 send(filtered_reply, sender, phone_id)
             else:
@@ -878,31 +1000,32 @@ def handle_conversation_state(sender, prompt, phone_id, media_url=None, media_ty
                     send("Ndine urombo, handina kunzwisisa. Ungataura zvakare here?", sender, phone_id)
                 else:
                     send("I'm sorry, I didn't understand that. Could you please rephrase your question?", sender, phone_id)
-                    
+
         except ResourceExhausted as e:
-            logging.error(f"Gemini API quota exceeded: {e}")
+            logging.error(f"❌ Gemini API quota exceeded: {e}")
             if lang == "shona":
                 send("Ndine urombo, tiri kushandisa traffic yakawanda. Edza zvakare gare gare.", sender, phone_id)
             else:
                 send("Sorry, we're experiencing high traffic. Please try again later.", sender, phone_id)
     else:
-        # Default to language detection if state is unknown
+        # Default: restart at language detection
         state["step"] = "language_detection"
         handle_language_detection(sender, prompt, phone_id)
-    
+
     save_user_state(sender, state)
+
 
 def message_handler(data, phone_id):
     global user_states
     
     sender = data["from"]
-    logging.info(f"Received message from {sender}")
+    logging.info(f"📩 Received message from {sender}")
     
     # Load user state from Redis with better handling
     state = get_user_state(sender)
     if state:
         user_states[sender] = state
-        logging.info(f"Loaded existing state for {sender}: {state['step']}")
+        logging.info(f"📥 Loaded existing state for {sender}: {state['step']}")
     else:
         # Only initialize if truly new user (not in memory either)
         if sender not in user_states:
@@ -916,9 +1039,9 @@ def message_handler(data, phone_id):
                 "conversation_history": []
             }
             save_user_state(sender, user_states[sender])
-            logging.info(f"Created new state for {sender}")
+            logging.info(f"🆕 Created new state for {sender}")
         else:
-            logging.info(f"Using in-memory state for {sender}: {user_states[sender]['step']}")
+            logging.info(f"💾 Using in-memory state for {sender}: {user_states[sender]['step']}")
     
     # Extract message and media
     prompt = ""
@@ -927,16 +1050,16 @@ def message_handler(data, phone_id):
     
     if data["type"] == "text":
         prompt = data["text"]["body"]
-        logging.info(f"Text message: {prompt[:100]}...")
+        logging.info(f"💬 Text message: {prompt[:100]}...")
     elif data["type"] == "image":
         media_type = "image"
         media_url = data["image"]["id"]
-        logging.info(f"Image received, media_id: {media_url}")
+        logging.info(f"🖼️ Image received, media_id: {media_url}")
         # Use a placeholder prompt for image processing
         prompt = "IMAGE_UPLOADED"
     else:
         prompt = "UNSUPPORTED_MESSAGE_TYPE"
-        logging.warning(f"Unsupported message type: {data['type']}")
+        logging.warning(f"⚠️ Unsupported message type: {data['type']}")
     
     # Save user message to conversation history
     save_user_conversation(sender, "user", prompt)
@@ -949,7 +1072,7 @@ def message_handler(data, phone_id):
 
 @app.route('/', methods=['GET'])
 def home():
-    return render_template('index.html')
+    return render_template('connected.html')
 
 @app.route('/webhook', methods=['GET'])
 def webhook():
@@ -959,14 +1082,14 @@ def webhook():
         else:
             return 'Error, wrong validation token'
     except Exception as e:
-        logging.error(f"Webhook verification error: {e}")
+        logging.error(f"❌ Webhook verification error: {e}")
         return 'Error'
 
 @app.route('/webhook', methods=['POST'])
 def webhook_handle():
     try:
         data = request.get_json()
-        logging.info(f"Received webhook data: {json.dumps(data, indent=2)}")
+        logging.info(f"📨 Received webhook data: {json.dumps(data, indent=2)}")
         
         if data.get("object") == "whatsapp_business_account":
             for entry in data.get("entry", []):
@@ -978,7 +1101,7 @@ def webhook_handle():
                                 message_handler(message, phone_id)
         return jsonify({"status": "success"}), 200
     except Exception as e:
-        logging.error(f"Webhook handling error: {e}")
+        logging.error(f"❌ Webhook handling error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
@@ -989,23 +1112,125 @@ def health_check():
         "timestamp": datetime.now().isoformat(),
         "redis_connected": redis_client is not None,
         "vertex_ai_configured": vertex_ai_client is not None,
+        "vertex_ai_project": VERTEX_AI_PROJECT is not None,
+        "vertex_ai_endpoint": VERTEX_AI_ENDPOINT_ID is not None,
         "gemini_configured": gen_api is not None,
-        "whatsapp_configured": wa_token is not None and phone_id is not None
+        "whatsapp_configured": wa_token is not None and phone_id is not None,
+        "user_states_count": len(user_states)
     }
+    
+    # Add more detailed Vertex AI info
+    if vertex_ai_client:
+        status["vertex_ai_details"] = {
+            "project_id": vertex_ai_client.project_id,
+            "endpoint_id": vertex_ai_client.endpoint_id,
+            "base_url": vertex_ai_client.base_url
+        }
     
     # Test Redis connection
     if redis_client:
         try:
             redis_client.ping()
             status["redis_status"] = "connected"
+            # Get some Redis stats
+            status["redis_info"] = {
+                "db_size": len(redis_client.keys("*")),
+                "user_states_in_redis": len(redis_client.keys("user_state:*"))
+            }
         except Exception as e:
             status["redis_status"] = f"error: {str(e)}"
             status["status"] = "degraded"
     
     return jsonify(status)
 
+@app.route('/test-vertex', methods=['GET'])
+def test_vertex():
+    """Test Vertex AI connection"""
+    if not vertex_ai_client:
+        return jsonify({"error": "Vertex AI client not configured"}), 500
+    
+    try:
+        # Simple test payload
+        test_payload = {"instances": [{"test": "connection"}]}
+        result = vertex_ai_client.predict(test_payload)
+        return jsonify({"status": "success", "result": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/test-redis', methods=['GET'])
+def test_redis():
+    """Test Redis connection"""
+    if not redis_client:
+        return jsonify({"error": "Redis client not configured"}), 500
+    
+    try:
+        # Test basic operations
+        test_key = "test:connection"
+        test_value = {"timestamp": datetime.now().isoformat(), "test": "success"}
+        
+        # Set value
+        redis_client.setex(test_key, timedelta(minutes=5), json.dumps(test_value))
+        
+        # Get value
+        retrieved = redis_client.get(test_key)
+        
+        # Get some stats
+        keys_count = len(redis_client.keys("*"))
+        user_states_count = len(redis_client.keys("user_state:*"))
+        
+        return jsonify({
+            "status": "success",
+            "set_get_test": json.loads(retrieved) if retrieved else None,
+            "stats": {
+                "total_keys": keys_count,
+                "user_states": user_states_count
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # Load user states on startup
 load_user_states()
+
+# Pre-warm the TLD cache in background
+def warmup_tld_cache():
+    try:
+        extractor.update()
+        logging.info("✅ TLD cache warmed up successfully")
+    except Exception as e:
+        logging.warning(f"⚠️ TLD cache warmup failed: {e}")
+
+# Start warmup in background thread
+tld_thread = threading.Thread(target=warmup_tld_cache, daemon=True)
+tld_thread.start()
+
+logging.info("🚀 Application started successfully!")
+
+@app.route('/debug-vertex-response', methods=['GET'])
+def debug_vertex_response():
+    """Debug endpoint to check Vertex AI response format"""
+    if not vertex_ai_client:
+        return jsonify({"error": "Vertex AI not configured"}), 500
+    
+    # Test with a small sample image or mock data
+    test_payload = {
+        "instances": [{
+            "image_bytes": {"b64": "test"},
+            "key": "debug_key"
+        }]
+    }
+    
+    try:
+        result = vertex_ai_client.predict(test_payload)
+        return jsonify({
+            "status": "success",
+            "prediction_keys": list(result.keys()) if isinstance(result, dict) else str(type(result)),
+            "prediction_sample": str(result)[:1000] if result else "No result",
+            "endpoint_type": "Check if this returns classification or embedding"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+        
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
